@@ -1,12 +1,5 @@
 """
 Heart Staging — FastAPI Backend  
-Endpoints:
-  POST /transcribe         — audio -> Whisper -> testo
-  POST /segment-audio      — trascrizione + stanze -> segmenti per stanza
-  POST /analyze-clarity    — foto stanza -> GPT-4V -> score + gap
-  POST /staging-brief      — foto + audio + livello -> brief per generazione
-  POST /generate           — brief + foto -> immagine staged (Replicate SDXL)
-  GET  /health             — health check
 """
 
 import os, base64, json, httpx, asyncio
@@ -123,8 +116,18 @@ async def staging_brief(room_name: str = Form(...), staging_level: str = Form(..
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/generate")
-async def generate_image(photo: UploadFile = File(...), sd_prompt: str = Form(...), sd_negative_prompt: str = Form(""), staging_level: str = Form("soft"), room_name: str = Form("")):
+@app.post("/generate-start")
+async def generate_start(
+    photo: UploadFile = File(...),
+    sd_prompt: str = Form(...),
+    sd_negative_prompt: str = Form(""),
+    staging_level: str = Form("soft"),
+    room_name: str = Form("")
+):
+    """
+    Avvia la generazione su Replicate e ritorna subito il prediction_id.
+    Il frontend fa il polling direttamente su Replicate per evitare timeout.
+    """
     replicate_key = os.getenv("REPLICATE_API_KEY")
     if not replicate_key:
         raise HTTPException(status_code=503, detail="REPLICATE_API_KEY non configurata")
@@ -134,34 +137,44 @@ async def generate_image(photo: UploadFile = File(...), sd_prompt: str = Form(..
         mime = photo.content_type or "image/jpeg"
         full_prompt = f"luxury airbnb interior, professional real estate photography, {sd_prompt}, 8k, photorealistic, warm lighting, staged home, editorial quality"
         negative = sd_negative_prompt or "blurry, distorted, low quality, cartoon, anime, unrealistic, cluttered, dark, overexposed, people, text, watermark"
-        strength_map = {"soft": 0.40, "medium": 0.60, "full": 0.80}
-        strength = strength_map.get(staging_level, 0.50)
+        strength_map = {"soft": 0.5, "medium": 0.65, "full": 0.8}
+        strength = strength_map.get(staging_level, 0.55)
+
         async with httpx.AsyncClient(timeout=30) as http:
             create_res = await http.post(
                 "https://api.replicate.com/v1/predictions",
                 headers={"Authorization": f"Token {replicate_key}", "Content-Type": "application/json"},
-                json={"version": "7762fd07cf82c948538e41f63f77d685e02b063e37e496e96eefd46c929f9bdc",
-                      "input": {"image": f"data:{mime};base64,{b64_image}", "prompt": full_prompt, "negative_prompt": negative,
-                                "prompt_strength": strength, "num_inference_steps": 30, "guidance_scale": 7.5,
-                                "width": 1024, "height": 768, "scheduler": "DPMSolverMultistep",
-                                "refine": "expert_ensemble_refiner", "high_noise_frac": 0.8}}
+                json={
+                    "version": "7762fd07cf82c948538e41f63f77d685e02b063e37e496e96eefd46c929f9bdc",
+                    "input": {
+                        "image": f"data:{mime};base64,{b64_image}",
+                        "prompt": full_prompt,
+                        "negative_prompt": negative,
+                        "prompt_strength": strength,
+                        "num_inference_steps": 30,
+                        "guidance_scale": 7.5,
+                        "width": 1024,
+                        "height": 768,
+                        "scheduler": "DPMSolverMultistep",
+                        "refine": "expert_ensemble_refiner",
+                        "high_noise_frac": 0.8
+                    }
+                }
             )
+
+        data = create_res.json()
         if create_res.status_code != 201:
-            raise HTTPException(status_code=502, detail=f"Replicate error: {create_res.text}")
-        prediction = create_res.json()
-        poll_url = prediction["urls"]["get"]
-        async with httpx.AsyncClient(timeout=30) as http:
-            for _ in range(40):
-                await asyncio.sleep(3)
-                poll_res = await http.get(poll_url, headers={"Authorization": f"Token {replicate_key}"})
-                poll_data = poll_res.json()
-                status = poll_data.get("status")
-                if status == "succeeded":
-                    output = poll_data.get("output", [])
-                    return {"ok": True, "room": room_name, "image_url": output[0] if output else "", "prompt_used": full_prompt, "strength": strength}
-                elif status == "failed":
-                    raise HTTPException(status_code=502, detail=f"Replicate failed: {poll_data.get('error')}")
-        raise HTTPException(status_code=504, detail="Replicate timeout")
+            raise HTTPException(status_code=502, detail=f"Replicate error {create_res.status_code}: {data}")
+
+        return {
+            "ok": True,
+            "prediction_id": data["id"],
+            "poll_url": data["urls"]["get"],
+            "replicate_token": replicate_key,
+            "room": room_name,
+            "prompt": full_prompt,
+            "strength": strength
+        }
     except HTTPException:
         raise
     except Exception as e:
