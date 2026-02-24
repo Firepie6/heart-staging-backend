@@ -40,10 +40,19 @@ async def transcribe(audio: UploadFile = File(...), language: str = Form("it")):
             model="whisper-1", file=audio_file, language=language,
             response_format="verbose_json", timestamp_granularities=["segment"]
         )
+        segments = response.segments or []
         return {
-            "ok": True, "text": response.text,
-            "segments": [{"start": s.start, "end": s.end, "text": s.text.strip()} for s in (response.segments or [])],
-            "duration": response.duration
+            "ok": True,
+            "text": response.text,
+            "segments": [
+                {
+                    "start": s["start"] if isinstance(s, dict) else s.start,
+                    "end": s["end"] if isinstance(s, dict) else s.end,
+                    "text": (s["text"] if isinstance(s, dict) else s.text).strip()
+                }
+                for s in segments
+            ],
+            "duration": getattr(response, "duration", None)
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
